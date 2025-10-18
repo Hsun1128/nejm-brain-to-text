@@ -25,6 +25,14 @@ parser.add_argument('--csv_path', type=str, default='../data/t15_copyTaskData_de
                     help='Path to the CSV file with metadata about the dataset (relative to the current working directory).')
 parser.add_argument('--gpu_number', type=int, default=1,
                     help='GPU number to use for RNN model inference. Set to -1 to use CPU.')
+parser.add_argument('--skip_lm', action='store_true',
+                    help='If set, skip running the language model and only output phoneme predictions.')
+parser.add_argument('--compute_per', action='store_true',
+                    help='If set with --eval_type val, compute aggregate phoneme error rate (PER) before LM.')
+parser.add_argument('--quiet', action='store_true',
+                    help='If set, suppress per-trial printing (useful when results are large).')
+parser.add_argument('--save_text', type=str, default=None,
+                    help='If set, save human-readable per-trial outputs to this text file.')
 args = parser.parse_args()
 
 # paths to model and data directories
@@ -126,6 +134,7 @@ pbar.close()
 
 
 # convert logits to phoneme sequences and print them out
+all_text_lines = []    # optional: for saving human-readable text
 for session, data in test_data.items():
     data['pred_seq'] = []
     for trial in range(len(data['logits'])):
@@ -143,107 +152,141 @@ for session, data in test_data.items():
         # print out the predicted sequences
         block_num = data['block_num'][trial]
         trial_num = data['trial_num'][trial]
-        print(f'Session: {session}, Block: {block_num}, Trial: {trial_num}')
+        # build human-readable lines
+        lines = []
+        lines.append(f'Session: {session}, Block: {block_num}, Trial: {trial_num}')
         if eval_type == 'val':
             sentence_label = data['sentence_label'][trial]
             true_seq = data['seq_class_ids'][trial][0:data['seq_len'][trial]]
             true_seq = [LOGIT_TO_PHONEME[p] for p in true_seq]
+            lines.append(f'Sentence label:      {sentence_label}')
+            lines.append(f'True sequence:       {" ".join(true_seq)}')
+        lines.append(f'Predicted Sequence:  {" ".join(pred_seq)}')
+        lines.append('')
 
-            print(f'Sentence label:      {sentence_label}')
-            print(f'True sequence:       {" ".join(true_seq)}')
-        print(f'Predicted Sequence:  {" ".join(pred_seq)}')
-        print()
+        # print if not quiet
+        if not args.quiet:
+            for l in lines:
+                print(l)
+
+        all_text_lines.extend(lines)
 
 
-# language model inference via redis
-# make sure that the standalone language model is running on the localhost redis ip
-# see README.md for instructions on how to run the language model
-r = redis.Redis(host='localhost', port=6379, db=0)
-r.flushall()  # clear all streams in redis
+if args.compute_per and eval_type == 'val':
+    total_edit_distance = 0
+    total_seq_length = 0
+    print('Computing aggregate PER (before LM)...')
+    for session, data in test_data.items():
+        for trial in range(len(data['pred_seq'])):
+            true_ids = data['seq_class_ids'][trial][0:data['seq_len'][trial]]
+            true_seq = [LOGIT_TO_PHONEME[p] for p in true_ids]
+            pred_seq = data['pred_seq'][trial]
+            ed = editdistance.eval(true_seq, pred_seq)
+            total_edit_distance += ed
+            total_seq_length += len(true_seq)
+    if total_seq_length > 0:
+        per = 100.0 * total_edit_distance / total_seq_length
+        print(f'Aggregate PER: {per:.2f}% ({total_edit_distance} / {total_seq_length})')
+        # also append to text output if requested
+        all_text_lines.append('')
+        all_text_lines.append('===== Aggregate Metrics (before LM) =====')
+        all_text_lines.append(f'Aggregate PER: {per:.2f}% ({total_edit_distance} / {total_seq_length})')
+    print()
 
-# define redis streams for the remote language model
-remote_lm_input_stream = 'remote_lm_input'
-remote_lm_output_partial_stream = 'remote_lm_output_partial'
-remote_lm_output_final_stream = 'remote_lm_output_final'
+## (moved) save human-readable text output will be done at the very end
 
-# set timestamps for last entries seen in the redis streams
-remote_lm_output_partial_lastEntrySeen = get_current_redis_time_ms(r)
-remote_lm_output_final_lastEntrySeen = get_current_redis_time_ms(r)
-remote_lm_done_resetting_lastEntrySeen = get_current_redis_time_ms(r)
-remote_lm_done_finalizing_lastEntrySeen = get_current_redis_time_ms(r)
-remote_lm_done_updating_lastEntrySeen = get_current_redis_time_ms(r)
+# language model inference via redis (optional)
+if not args.skip_lm:
+    # make sure that the standalone language model is running on the localhost redis ip
+    # see README.md for instructions on how to run the language model
+    r = redis.Redis(host='localhost', port=6379, db=0)
+    r.flushall()  # clear all streams in redis
 
-lm_results = {
-    'session': [],
-    'block': [],
-    'trial': [],
-    'true_sentence': [],
-    'pred_sentence': [],
-}
+    # define redis streams for the remote language model
+    remote_lm_input_stream = 'remote_lm_input'
+    remote_lm_output_partial_stream = 'remote_lm_output_partial'
+    remote_lm_output_final_stream = 'remote_lm_output_final'
 
-# loop through all trials and put logits into the remote language model to get text predictions
-# note: this takes ~15-20 minutes to run on the entire test split with the 5-gram LM + OPT rescoring (RTX 4090)
-with tqdm(total=total_test_trials, desc='Running remote language model', unit='trial') as pbar:
-    for session in test_data.keys():
-        for trial in range(len(test_data[session]['logits'])):
-            # get trial logits and rearrange them for the LM
-            logits = rearrange_speech_logits_pt(test_data[session]['logits'][trial])[0]
+    # set timestamps for last entries seen in the redis streams
+    remote_lm_output_partial_lastEntrySeen = get_current_redis_time_ms(r)
+    remote_lm_output_final_lastEntrySeen = get_current_redis_time_ms(r)
+    remote_lm_done_resetting_lastEntrySeen = get_current_redis_time_ms(r)
+    remote_lm_done_finalizing_lastEntrySeen = get_current_redis_time_ms(r)
+    remote_lm_done_updating_lastEntrySeen = get_current_redis_time_ms(r)
 
-            # reset language model
-            remote_lm_done_resetting_lastEntrySeen = reset_remote_language_model(r, remote_lm_done_resetting_lastEntrySeen)
-            
-            '''
-            # update language model parameters
-            remote_lm_done_updating_lastEntrySeen = update_remote_lm_params(
-                r,
-                remote_lm_done_updating_lastEntrySeen,
-                acoustic_scale=0.35,
-                blank_penalty=90.0,
-                alpha=0.55,
-            )
-            '''
+    lm_results = {
+        'session': [],
+        'block': [],
+        'trial': [],
+        'true_sentence': [],
+        'pred_sentence': [],
+    }
 
-            # put logits into LM
-            remote_lm_output_partial_lastEntrySeen, decoded = send_logits_to_remote_lm(
-                r,
-                remote_lm_input_stream,
-                remote_lm_output_partial_stream,
-                remote_lm_output_partial_lastEntrySeen,
-                logits,
-            )
+    # loop through all trials and put logits into the remote language model to get text predictions
+    # note: this takes ~15-20 minutes to run on the entire test split with the 5-gram LM + OPT rescoring (RTX 4090)
+    with tqdm(total=total_test_trials, desc='Running remote language model', unit='trial') as pbar:
+        for session in test_data.keys():
+            for trial in range(len(test_data[session]['logits'])):
+                # get trial logits and rearrange them for the LM
+                logits = rearrange_speech_logits_pt(test_data[session]['logits'][trial])[0]
 
-            # finalize remote LM
-            remote_lm_output_final_lastEntrySeen, lm_out = finalize_remote_lm(
-                r,
-                remote_lm_output_final_stream,
-                remote_lm_output_final_lastEntrySeen,
-            )
+                # reset language model
+                remote_lm_done_resetting_lastEntrySeen = reset_remote_language_model(r, remote_lm_done_resetting_lastEntrySeen)
+                
+                '''
+                # update language model parameters
+                remote_lm_done_updating_lastEntrySeen = update_remote_lm_params(
+                    r,
+                    remote_lm_done_updating_lastEntrySeen,
+                    acoustic_scale=0.35,
+                    blank_penalty=90.0,
+                    alpha=0.55,
+                )
+                '''
 
-            # get the best candidate sentence
-            best_candidate_sentence = lm_out['candidate_sentences'][0]
+                # put logits into LM
+                remote_lm_output_partial_lastEntrySeen, decoded = send_logits_to_remote_lm(
+                    r,
+                    remote_lm_input_stream,
+                    remote_lm_output_partial_stream,
+                    remote_lm_output_partial_lastEntrySeen,
+                    logits,
+                )
 
-            # store results
-            lm_results['session'].append(session)
-            lm_results['block'].append(test_data[session]['block_num'][trial])
-            lm_results['trial'].append(test_data[session]['trial_num'][trial])
-            if eval_type == 'val':
-                lm_results['true_sentence'].append(test_data[session]['sentence_label'][trial])
-            else:
-                lm_results['true_sentence'].append(None)
-            lm_results['pred_sentence'].append(best_candidate_sentence)
+                # finalize remote LM
+                remote_lm_output_final_lastEntrySeen, lm_out = finalize_remote_lm(
+                    r,
+                    remote_lm_output_final_stream,
+                    remote_lm_output_final_lastEntrySeen,
+                )
 
-            # update progress bar
-            pbar.update(1)
-pbar.close()
+                # get the best candidate sentence
+                best_candidate_sentence = lm_out['candidate_sentences'][0]
+
+                # store results
+                lm_results['session'].append(session)
+                lm_results['block'].append(test_data[session]['block_num'][trial])
+                lm_results['trial'].append(test_data[session]['trial_num'][trial])
+                if eval_type == 'val':
+                    lm_results['true_sentence'].append(test_data[session]['sentence_label'][trial])
+                else:
+                    lm_results['true_sentence'].append(None)
+                lm_results['pred_sentence'].append(best_candidate_sentence)
+
+                # update progress bar
+                pbar.update(1)
+    pbar.close()
 
 
 # if using the validation set, lets calculate the aggregate word error rate (WER)
-if eval_type == 'val':
+if (not args.skip_lm) and eval_type == 'val':
     total_true_length = 0
     total_edit_distance = 0
 
     lm_results['edit_distance'] = []
     lm_results['num_words'] = []
+
+    all_text_lines.append('------------------------------------------------------')
 
     for i in range(len(lm_results['pred_sentence'])):
         true_sentence = remove_punctuation(lm_results['true_sentence'][i]).strip()
@@ -256,19 +299,59 @@ if eval_type == 'val':
         lm_results['edit_distance'].append(ed)
         lm_results['num_words'].append(len(true_sentence.split()))
 
-        print(f'{lm_results["session"][i]} - Block {lm_results["block"][i]}, Trial {lm_results["trial"][i]}')
-        print(f'True sentence:       {true_sentence}')
-        print(f'Predicted sentence:  {pred_sentence}')
-        print(f'WER: {ed} / {100 * len(true_sentence.split())} = {ed / len(true_sentence.split()):.2f}%')
-        print()
+        if not args.quiet:
+            print(f'{lm_results["session"][i]} - Block {lm_results["block"][i]}, Trial {lm_results["trial"][i]}')
+            print(f'True sentence:       {true_sentence}')
+            print(f'Predicted sentence:  {pred_sentence}')
+            print(f'WER: {ed} / {100 * len(true_sentence.split())} = {ed / len(true_sentence.split()):.2f}%')
+            print()
+
+        # also append per-trial WER info to text output if requested
+        all_text_lines.append(f'{lm_results["session"][i]} - Block {lm_results["block"][i]}, Trial {lm_results["trial"][i]}')
+        all_text_lines.append(f'True sentence:       {true_sentence}')
+        all_text_lines.append(f'Predicted sentence:  {pred_sentence}')
+        all_text_lines.append(f'WER: {ed} / {100 * len(true_sentence.split())} = {ed / len(true_sentence.split()):.2f}%')
+        all_text_lines.append('')
 
     print(f'Total true sentence length: {total_true_length}')
     print(f'Total edit distance: {total_edit_distance}')
     print(f'Aggregate Word Error Rate (WER): {100 * total_edit_distance / total_true_length:.2f}%')
 
+    # append aggregate WER summary to text output
+    all_text_lines.append('')
+    all_text_lines.append('===== Aggregate Metrics (after LM) =====')
+    all_text_lines.append(f'Total true sentence length: {total_true_length}')
+    all_text_lines.append(f'Total edit distance: {total_edit_distance}')
+    all_text_lines.append(f'Aggregate Word Error Rate (WER): {100 * total_edit_distance / total_true_length:.2f}%')
 
-# write predicted sentences to a csv file. put a timestamp in the filename (YYYYMMDD_HHMMSS)
-output_file = os.path.join(model_path, f'baseline_rnn_{eval_type}_predicted_sentences_{time.strftime("%Y%m%d_%H%M%S")}.csv')
-ids = [i for i in range(len(lm_results['pred_sentence']))]
-df_out = pd.DataFrame({'id': ids, 'text': lm_results['pred_sentence']})
-df_out.to_csv(output_file, index=False)
+
+    # write predicted sentences to a csv file. put a timestamp in the filename (YYYYMMDD_HHMMSS)
+    output_file = os.path.join(model_path, f'baseline_rnn_{eval_type}_predicted_sentences_{time.strftime("%Y%m%d_%H%M%S")}.csv')
+    ids = [i for i in range(len(lm_results['pred_sentence']))]
+    df_out = pd.DataFrame({'id': ids, 'text': lm_results['pred_sentence']})
+    df_out.to_csv(output_file, index=False)
+
+# finally, write human-readable text output (after LM/WER and CSV are done)
+if args.save_text is not None:
+    try:
+        if isinstance(args.save_text, str) and args.save_text.strip() != '':
+            requested_path = args.save_text.strip()
+            if requested_path.endswith(os.sep) or os.path.isdir(requested_path):
+                parent_dir = requested_path.rstrip(os.sep) or model_path
+                timestamp = time.strftime('%Y%m%d_%H%M%S')
+                filename = f'baseline_rnn_{eval_type}_phonemes_{timestamp}.txt'
+                save_path = os.path.join(parent_dir, filename)
+            else:
+                save_path = requested_path
+                parent_dir = os.path.dirname(save_path)
+                if parent_dir == '':
+                    parent_dir = model_path
+                    save_path = os.path.join(parent_dir, os.path.basename(save_path))
+            os.makedirs(parent_dir, exist_ok=True)
+            with open(save_path, 'w') as f:
+                f.write('\n'.join(all_text_lines))
+            print(f'Saved textual predictions to {save_path}')
+        else:
+            print('Skipped saving textual predictions: empty --save_text path provided.')
+    except Exception as e:
+        print(f'Failed to save textual predictions: {e}')
