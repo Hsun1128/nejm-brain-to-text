@@ -12,8 +12,8 @@ conda activate b2txt25
 # Upgrade pip
 pip install --upgrade pip
 
-# Install PyTorch with CUDA 12.6
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+# Install PyTorch with CUDA 12.1
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 # Install additional packages
 # TODO: remove redis
