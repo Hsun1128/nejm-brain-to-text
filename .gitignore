@@ -5,5 +5,19 @@
 # ignore rdb files
 *.rdb
 
-# ignore ds_store files
+# ignore . hidden files
 .DS_Store
+.cache/
+.cmake/
+.conda/
+.nv/
+.triton/
+.pytest_cache/
+.bash_history
+.bashrc
+
+
+# ignore directories
+data/
+language_model/runtime/
+model_training/trained_models/
