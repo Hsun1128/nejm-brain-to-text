@@ -1,0 +1,27 @@
+# VCS
+.git
+
+# Cache
+.nv
+.cache
+.conda
+.bash_history
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints
+
+# Environment
+.venv
+env/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# Data & File
+analyses/
+data/
+model_training/

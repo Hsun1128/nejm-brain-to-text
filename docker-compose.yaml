@@ -1,0 +1,28 @@
+services:
+  b2txt25:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: b2txt25
+    # user: "${USER_ID:-1000}:${GROUP_ID:-1000}"  # 使用主機的用戶ID和組ID
+    network_mode: host  # 修正: 將icp: host改為network_mode: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              count: all  # 使用所有GPU
+    volumes:
+      # 將本地目錄直接掛載到容器內的/app目錄
+      - .:/app
+      # 添加共享記憶體卷以解決之前的shm問題
+      - /dev/shm:/dev/shm
+    working_dir: /app  # 設置工作目錄為/app
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all  # 使用所有可用的GPU
+      - HOME=/app  # 確保HOME環境變數正確設置
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    
+    # restart: unless-stopped
+    command: tail -f /dev/null # 保持容器運行
