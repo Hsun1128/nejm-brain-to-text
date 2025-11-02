@@ -21,3 +21,6 @@
 data/
 language_model/runtime/
 model_training/trained_models/
+build/
+
+model_training/rnn_args.yaml
