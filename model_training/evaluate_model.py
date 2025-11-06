@@ -74,6 +74,10 @@ model = GRUDecoder(
     n_layers = model_args['model']['n_layers'],
     patch_size = model_args['model']['patch_size'],
     patch_stride = model_args['model']['patch_stride'],
+    use_self_attention = model_args['model'].get('use_self_attention', False),
+    attn_num_heads = model_args['model'].get('attn_num_heads', 8),
+    attn_dropout = model_args['model'].get('attn_dropout', 0.1),
+    use_layer_norm = model_args['model'].get('use_layer_norm', False),
 )
 
 # load model weights

@@ -22,7 +22,9 @@ class BrainToTextDataset(Dataset):
             days_per_batch = 1, 
             random_seed = -1,
             must_include_days = None,
-            feature_subset = None
+            feature_subset = None,
+            use_balanced_day_sampling = False,  # NEW: Enable balanced sampling based on trial counts
+            balanced_sampling_alpha = 0.5,      # NEW: Weighting strength (0.5 = square-root, 1.0 = inverse)
             ): 
         '''
         trial_indicies:  (dict)      - dictionary with day numbers as keys and lists of trial indices as values
@@ -33,7 +35,9 @@ class BrainToTextDataset(Dataset):
                                        to individual day layers in the GRU are not excesively noisy. Validation data will always have 1 day per batch
         random_seed:     (int)       - seed to set for randomly assigning trials to a batch. If set to -1, trial assignment will be random
         must_include_days ([int])    - list of days that must be included in every batch
-        feature_subset  ([int])      - list of neural feature indicies that should be the only features included in the neural data 
+        feature_subset  ([int])      - list of neural feature indicies that should be the only features included in the neural data
+        use_balanced_day_sampling (bool) - whether to use inverse-proportional sampling for days (default: False)
+        balanced_sampling_alpha (float) - weighting strength: 0.5=square-root (moderate), 1.0=inverse (strong)
          '''
         
         # Set random seed for reproducibility
@@ -59,6 +63,8 @@ class BrainToTextDataset(Dataset):
         self.n_days = len(trial_indicies.keys())
 
         self.feature_subset = feature_subset
+        self.use_balanced_day_sampling = use_balanced_day_sampling
+        self.balanced_sampling_alpha = balanced_sampling_alpha
 
         # Calculate total number of trials in the dataset
         for d in trial_indicies:
@@ -170,23 +176,65 @@ class BrainToTextDataset(Dataset):
         batch_index = {}
 
         # Precompute the days that are not in must_include_days
+        non_must_include_days = None
         if self.must_include_days is not None:
             non_must_include_days = [d for d in self.trial_indicies.keys() if d not in self.must_include_days]
+
+        # Compute sampling weights based on inverse of trial counts (for balanced sampling)
+        # Reference: "Learning from Imbalanced Data" (He & Garcia, 2009)
+        # Rationale: Days with fewer trials need more training opportunities to learn effective day-specific weights
+        # Weight formula: weight[i] = 1 / count[i]^alpha, where alpha controls the rebalancing strength
+        # alpha=1.0: inverse proportional (strong rebalancing)
+        # alpha=0.5: square-root (moderate rebalancing, recommended by many studies)
+        use_balanced_sampling = getattr(self, 'use_balanced_day_sampling', False)
+        balanced_sampling_alpha = getattr(self, 'balanced_sampling_alpha', 0.5)  # Default: square-root weighting
+        
+        if use_balanced_sampling and non_must_include_days is not None:
+            # Calculate weights for non-must-include days
+            trial_counts = np.array([len(self.trial_indicies[d]['trials']) for d in non_must_include_days])
+            # Avoid division by zero
+            trial_counts = np.maximum(trial_counts, 1)
+            # Inverse square-root weighting (or alpha-scaled)
+            weights = 1.0 / (trial_counts ** balanced_sampling_alpha)
+            weights = weights / weights.sum()  # Normalize to probabilities
+            day_to_weight = {d: w for d, w in zip(non_must_include_days, weights)}
+        else:
+            day_to_weight = None
 
         for batch_idx in range(self.n_batches):
             batch = {}
 
-            # Which days will be used for this batch. Picked randomly without replacement
-            # TODO: In the future we may want to consider sampling days in proportion to the number of trials in each day 
-
+            # Which days will be used for this batch
             # If must_include_days is not empty, we will use those days and then randomly sample the rest
             if self.must_include_days is not None and len(self.must_include_days) > 0:
-
-                days = np.concatenate((self.must_include_days, np.random.choice(non_must_include_days, size = self.days_per_batch - len(self.must_include_days), replace = False)))
+                if use_balanced_sampling and day_to_weight is not None:
+                    # Weighted sampling for non-must-include days
+                    remaining_days = self.days_per_batch - len(self.must_include_days)
+                    if remaining_days > 0:
+                        sampled_days = np.random.choice(
+                            non_must_include_days, 
+                            size=remaining_days, 
+                            replace=False,
+                            p=[day_to_weight[d] for d in non_must_include_days]
+                        )
+                        days = np.concatenate((self.must_include_days, sampled_days))
+                    else:
+                        days = np.array(self.must_include_days)
+                else:
+                    days = np.concatenate((self.must_include_days, np.random.choice(non_must_include_days, size = self.days_per_batch - len(self.must_include_days), replace = False)))
             
             # Otherwise we will select random days without replacement
-            else: 
-                days = np.random.choice(list(self.trial_indicies.keys()), size = self.days_per_batch, replace = False)
+            else:
+                if use_balanced_sampling:
+                    # Weighted sampling based on inverse trial counts
+                    all_days = list(self.trial_indicies.keys())
+                    trial_counts = np.array([len(self.trial_indicies[d]['trials']) for d in all_days])
+                    trial_counts = np.maximum(trial_counts, 1)
+                    weights = 1.0 / (trial_counts ** balanced_sampling_alpha)
+                    weights = weights / weights.sum()
+                    days = np.random.choice(all_days, size=self.days_per_batch, replace=False, p=weights)
+                else:
+                    days = np.random.choice(list(self.trial_indicies.keys()), size = self.days_per_batch, replace = False)
             
             # How many trials will be sampled from each day
             num_trials = math.ceil(self.batch_size / self.days_per_batch) # Use ceiling to make sure we get at least batch_size trials

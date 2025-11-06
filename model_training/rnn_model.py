@@ -3,9 +3,9 @@ from torch import nn
 
 class GRUDecoder(nn.Module):
     '''
-    Defines the GRU decoder
+    Defines the GRU decoder with optional self-attention
 
-    This class combines day-specific input layers, a GRU, and an output classification layer
+    This class combines day-specific input layers, a GRU, optional self-attention, and an output classification layer
     '''
     def __init__(self,
                  neural_dim,
@@ -17,6 +17,10 @@ class GRUDecoder(nn.Module):
                  n_layers = 5, 
                  patch_size = 0,
                  patch_stride = 0,
+                 use_self_attention = False,  # NEW: Enable self-attention mechanism
+                 attn_num_heads = 8,          # NEW: Number of attention heads
+                 attn_dropout = 0.1,          # NEW: Dropout for attention
+                 use_layer_norm = False,      # NEW: Use layer normalization with attention
                  ):
         '''
         neural_dim  (int)      - number of channels in a single timestep (e.g. 512)
@@ -28,6 +32,10 @@ class GRUDecoder(nn.Module):
         n_layers    (int)      - number of recurrent layers 
         patch_size  (int)      - the number of timesteps to concat on initial input layer - a value of 0 will disable this "input concat" step 
         patch_stride(int)      - the number of timesteps to stride over when concatenating initial input 
+        use_self_attention (bool) - whether to use causal self-attention after GRU
+        attn_num_heads (int)   - number of attention heads
+        attn_dropout (float)   - dropout rate for attention layers
+        use_layer_norm (bool)  - whether to use layer normalization with attention
         '''
         super(GRUDecoder, self).__init__()
         
@@ -42,6 +50,10 @@ class GRUDecoder(nn.Module):
         
         self.patch_size = patch_size
         self.patch_stride = patch_stride
+        self.use_self_attention = use_self_attention
+        self.attn_num_heads = attn_num_heads
+        self.attn_dropout = attn_dropout
+        self.use_layer_norm = use_layer_norm
 
         # Parameters for the day-specific input layers
         self.day_layer_activation = nn.Softsign() # basically a shallower tanh 
@@ -78,7 +90,32 @@ class GRUDecoder(nn.Module):
             if "weight_ih" in name:
                 nn.init.xavier_uniform_(param)
 
-        # Prediciton head. Weight init to xavier
+        # Self-attention mechanism (causal, for real-time decoding)
+        if self.use_self_attention:
+            self.self_attn = nn.MultiheadAttention(
+                embed_dim=self.n_units,
+                num_heads=self.attn_num_heads,
+                dropout=self.attn_dropout,
+                batch_first=True,
+            )
+            # Layer normalization for attention (optional)
+            if self.use_layer_norm:
+                self.attn_norm = nn.LayerNorm(self.n_units)
+            else:
+                self.attn_norm = nn.Identity()
+            
+            # Feed-forward network after attention (optional enhancement)
+            self.attn_ffn = nn.Sequential(
+                nn.Linear(self.n_units, self.n_units * 4),
+                nn.ReLU(),
+                nn.Dropout(self.attn_dropout),
+                nn.Linear(self.n_units * 4, self.n_units),
+                nn.Dropout(self.attn_dropout),
+            )
+            nn.init.xavier_uniform_(self.attn_ffn[0].weight)
+            nn.init.xavier_uniform_(self.attn_ffn[3].weight)
+
+        # Prediction head. Weight init to xavier
         self.out = nn.Linear(self.n_units, self.n_classes)
         nn.init.xavier_uniform_(self.out.weight)
 
@@ -124,6 +161,29 @@ class GRUDecoder(nn.Module):
 
         # Pass input through RNN 
         output, hidden_states = self.gru(x, states)
+
+        # Apply causal self-attention (if enabled)
+        if self.use_self_attention:
+            # Create causal mask: each position can only attend to itself and previous positions
+            seq_len = output.shape[1]
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=output.device, dtype=torch.bool), diagonal=1)
+            
+            # Self-attention with causal masking
+            attn_output, _ = self.self_attn(
+                output, output, output,
+                attn_mask=causal_mask,
+                need_weights=False
+            )
+            
+            # Residual connection and normalization
+            output = self.attn_norm(attn_output + output)
+            
+            # Optional feed-forward network
+            if hasattr(self, 'attn_ffn'):
+                ffn_output = self.attn_ffn(output)
+                output = output + ffn_output  # Residual connection
+                if self.use_layer_norm:
+                    output = self.attn_norm(output)
 
         # Compute logits
         logits = self.out(output)

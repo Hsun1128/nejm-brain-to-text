@@ -127,6 +127,10 @@ class BrainToTextDecoder_Trainer:
             n_layers = self.args['model']['n_layers'],
             patch_size = self.args['model']['patch_size'],
             patch_stride = self.args['model']['patch_stride'],
+            use_self_attention = self.args['model'].get('use_self_attention', False),
+            attn_num_heads = self.args['model'].get('attn_num_heads', 8),
+            attn_dropout = self.args['model'].get('attn_dropout', 0.1),
+            use_layer_norm = self.args['model'].get('use_layer_norm', False),
         )
 
         # Call torch.compile to speed up training
@@ -192,7 +196,9 @@ class BrainToTextDecoder_Trainer:
             batch_size = self.args['dataset']['batch_size'],
             must_include_days = None,
             random_seed = self.args['dataset']['seed'],
-            feature_subset = feature_subset
+            feature_subset = feature_subset,
+            use_balanced_day_sampling = self.args['dataset'].get('use_balanced_day_sampling', False),
+            balanced_sampling_alpha = self.args['dataset'].get('balanced_sampling_alpha', 0.5),
             )
         self.train_loader = DataLoader(
             self.train_dataset,
@@ -243,7 +249,32 @@ class BrainToTextDecoder_Trainer:
 
         # If a checkpoint is provided, then load from checkpoint
         if self.args['init_from_checkpoint']:
-            self.load_model_checkpoint(self.args['init_checkpoint_path'])
+            # Optionally reset optimizer/scheduler: only load weights, rebuild optim/sched with current args
+            if self.args.get('reset_optim_sched', False):
+                load_path = self.args['init_checkpoint_path']
+                checkpoint = torch.load(load_path, weights_only = False)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.best_val_PER = checkpoint.get('val_PER', self.best_val_PER)
+                self.best_val_loss = checkpoint.get('val_loss', self.best_val_loss)
+                self.model.to(self.device)
+
+                # Rebuild optimizer and scheduler under current LR settings
+                self.optimizer = self.create_optimizer()
+                if self.args['lr_scheduler_type'] == 'linear':
+                    self.learning_rate_scheduler = torch.optim.lr_scheduler.LinearLR(
+                        optimizer = self.optimizer,
+                        start_factor = 1.0,
+                        end_factor = self.args['lr_min'] / self.args['lr_max'],
+                        total_iters = self.args['lr_decay_steps'],
+                    )
+                elif self.args['lr_scheduler_type'] == 'cosine':
+                    self.learning_rate_scheduler = self.create_cosine_lr_scheduler(self.optimizer)
+                else:
+                    raise ValueError(f"Invalid learning rate scheduler type: {self.args['lr_scheduler_type']}")
+
+                self.logger.info("Loaded model weights only and reset optimizer/scheduler per args (reset_optim_sched=True)")
+            else:
+                self.load_model_checkpoint(self.args['init_checkpoint_path'])
 
         # Set rnn and/or input layers to not trainable if specified 
         for name, param in self.model.named_parameters():
@@ -447,8 +478,10 @@ class BrainToTextDecoder_Trainer:
         if mode == 'train':
             # add static gain noise 
             if self.transform_args['static_gain_std'] > 0:
-                warp_mat = torch.tile(torch.unsqueeze(torch.eye(channels), dim = 0), (batch_size, 1, 1))
-                warp_mat += torch.randn_like(warp_mat, device=self.device) * self.transform_args['static_gain_std']
+                # Create eye on the same device and dtype as features to avoid device/dtype mismatch
+                eye = torch.eye(channels, device=self.device, dtype=features.dtype)
+                warp_mat = torch.tile(eye.unsqueeze(0), (batch_size, 1, 1))
+                warp_mat = warp_mat + torch.randn_like(warp_mat) * self.transform_args['static_gain_std']
 
                 features = torch.matmul(features, warp_mat)
 
@@ -541,18 +574,38 @@ class BrainToTextDecoder_Trainer:
                     input_lengths = adjusted_lens,
                     target_lengths = phone_seq_lens
                     )
-                    
-                loss = torch.mean(loss) # take mean loss over batches
+                
+                # Length-normalized CTC Loss
+                # Reference: "Connectionist Temporal Classification" (Graves et al., 2006)
+                # Problem: Direct averaging of CTC losses across sequences of different lengths
+                #          causes long sequences to dominate gradients (their loss values are naturally larger)
+                # Solution: Normalize each sample's loss by its sequence length
+                # Rationale: This ensures all sequences contribute equally to the gradient, 
+                #           preventing the model from overfitting to long sequences
+                # Implementation: Divide by target_lengths (phoneme sequence length) as per common practice
+                #                 in speech recognition (e.g., WeNet, ESPnet)
+                if self.args.get('normalize_ctc_loss_by_length', False):
+                    # Normalize by target sequence length (number of phonemes)
+                    # This makes loss per phoneme rather than total loss
+                    loss = loss / phone_seq_lens.float()
+                    loss = torch.mean(loss)
+                else:
+                    # Original: simple mean (favors long sequences)
+                    loss = torch.mean(loss)
             
             loss.backward()
 
             # Clip gradient
+            grad_norm = None
             if self.args['grad_norm_clip_value'] > 0: 
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 
                                                max_norm = self.args['grad_norm_clip_value'],
                                                error_if_nonfinite = True,
                                                foreach = True
                                                )
+            else:
+                # Compute gradient norm even if not clipping (for logging)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float('inf'))
 
             self.optimizer.step()
             self.learning_rate_scheduler.step()
@@ -714,7 +767,12 @@ class BrainToTextDecoder_Trainer:
                         adjusted_lens,
                         phone_seq_lens,
                     )
-                    loss = torch.mean(loss)
+                    # Apply same length normalization as training for consistency
+                    if self.args.get('normalize_ctc_loss_by_length', False):
+                        loss = loss / phone_seq_lens.float()
+                        loss = torch.mean(loss)
+                    else:
+                        loss = torch.mean(loss)
 
                 metrics['losses'].append(loss.cpu().detach().numpy())
 
