@@ -7,3 +7,14 @@
 
 # ignore ds_store files
 .DS_Store
+
+.cache/
+.conda/
+.cursor/
+.nv/
+.triton/
+.cmake/
+.bash_history
+
+# training files
+model_training/trained_models/
